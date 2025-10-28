@@ -1,22 +1,18 @@
 """
-Minimal chat agent skeleton for a Text Generation Inference (TGI) endpoint.
-
-The goal is to demonstrate how to wrap a local TGI server that has been launched
-with the `tool_choice` Guidance program so that it accepts OpenAI-style tool
-specifications and returns tool-calling events. Fill in the TODOs with your
-project-specific logic.
+Modernized chat agent that wraps a local OpenAI-compatible endpoint using
+llama-index's AgentWorkflow and OpenAILike client.
 """
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-import requests
-
+from llama_index.core.agent.workflow import AgentWorkflow
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
+from llama_index.llms.openai_like import OpenAILike
 
 from .toolkit import BaseTool, ToolOutput
 
@@ -25,152 +21,172 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TGIConfig:
-    """Connection settings for the TGI endpoint."""
+    """Connection and model settings for the OpenAI-compatible endpoint."""
 
     endpoint_url: str = "http://localhost:8080/v1/chat/completions"
     timeout: float = 120.0
-    api_key: Optional[str] = None  # Set if your gateway enforces auth
-    model: Optional[str] = None  # Optional: pass-through for multi-model routers
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    system_prompt: str = "You are a helpful assistant."
+    llm_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    def api_base(self) -> str:
+        """Return the base URL expected by OpenAILike."""
+        url = self.endpoint_url.rstrip("/")
+        if url.endswith("/chat/completions"):
+            url = url[: -len("/chat/completions")]
+        return url
+
+    def model_name(self) -> str:
+        return self.model or "casperhansen/llama-3.3-70b-instruct-awq"
 
 
 class TGIChatAgent:
-    """
-    Lightweight controller that speaks to a TGI server using the OpenAI-compatible
-    tool-calling contract. This class intentionally mirrors the public surface of
-    `MedGeminiAgent` so you can swap implementations easily.
-    """
+    """Thin wrapper around AgentWorkflow for local TGI-style deployments."""
 
     def __init__(
         self,
         *,
         config: TGIConfig,
         tools: Optional[Iterable[BaseTool]] = None,
+        event_handler: Optional[Callable[[Any], None]] = None,
+        http_client: Optional[Any] = None,
+        async_http_client: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.tools: List[BaseTool] = list(tools or [])
         self._chat_history: List[ChatMessage] = []
+        self._event_handler = event_handler
+        self._http_client = http_client
+        self._async_http_client = async_http_client
 
-    # ---------------------------------------------------------------------
+        self._llm = self._create_llm()
+        self._workflow = self._create_workflow(self.tools)
+
+    # ------------------------------------------------------------------
     # Public API
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def chat(
         self,
         message: str,
         *,
         tool_choice: str | Dict[str, Any] = "auto",
+        **run_kwargs: Any,
     ) -> ChatMessage:
-        """
-        Send a message to the TGI endpoint and orchestrate any required tool calls.
-        Returns the final assistant message.
-        """
-        self._append_user_message(message)
+        """Send a message through the workflow and return the assistant reply."""
+        # AgentWorkflow handles tool routing internally; tool_choice is currently
+        # unused but kept for API compatibility.
+        del tool_choice
 
-        while True:
-            payload = self._build_payload(tool_choice)
-            logger.debug("Dispatching payload to TGI: %s", payload)
+        workflow_result = self._execute_workflow(message, **run_kwargs)
 
-            response = self._invoke_tgi(payload)
-            assistant_message = self._extract_message(response)
+        user_message = ChatMessage(role=MessageRole.USER, content=message)
+        self._chat_history.append(user_message)
 
-            self._chat_history.append(assistant_message)
-            tool_calls = response.get("tool_calls") or assistant_message.additional_kwargs.get(
-                "tool_calls"
-            )
+        tool_messages = self._materialize_tool_messages(workflow_result.tool_calls)
+        self._chat_history.extend(tool_messages)
 
-            if not tool_calls:
-                return assistant_message
-
-            logger.debug("Handling tool calls returned by the model: %s", tool_calls)
-            self._run_tools(tool_calls)
+        assistant_message = self._ensure_chat_message(workflow_result.response)
+        self._chat_history.append(assistant_message)
+        return assistant_message
 
     def reset(self) -> None:
-        """Clear the conversation state."""
+        """Clear any stored conversation state."""
         self._chat_history.clear()
 
-    # ---------------------------------------------------------------------
-    # Internal helpers
-    # ---------------------------------------------------------------------
-    def _append_user_message(self, message: str) -> None:
-        self._chat_history.append(ChatMessage(role=MessageRole.USER, content=message))
+    @property
+    def history(self) -> Sequence[ChatMessage]:  # pragma: no cover - convenience
+        return tuple(self._chat_history)
 
-    def _build_payload(self, tool_choice: str | Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Construct the OpenAI-style payload expected by TGI's `tool_choice` guidance.
-        Override this method to expose additional knobs (temperature, stop, etc.).
-        """
-        payload: Dict[str, Any] = {
-            "messages": [m.model_dump() for m in self._chat_history],
-            "tools": [tool.metadata.to_openai_tool() for tool in self.tools],
-            "tool_choice": tool_choice,
-        }
-        if self.config.model:
-            payload["model"] = self.config.model
-        return payload
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+    def _create_llm(self) -> OpenAILike:
+        llm_kwargs = dict(self.config.llm_kwargs)
+        llm_kwargs.setdefault("timeout", self.config.timeout)
+        llm_kwargs.setdefault("is_chat_model", True)
+        llm_kwargs.setdefault("is_function_calling_model", True)
 
-    def _invoke_tgi(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
-
-        response = requests.post(
-            self.config.endpoint_url,
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=self.config.timeout,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]
-
-    def _extract_message(self, response: Dict[str, Any]) -> ChatMessage:
-        """
-        Convert the OpenAI-style message dict returned by TGI into a ChatMessage.
-        """
-        content = response.get("content")
-        additional_kwargs = {k: v for k, v in response.items() if k != "content"}
-        return ChatMessage(
-            role=MessageRole.ASSISTANT,
-            content=content,
-            additional_kwargs=additional_kwargs,
+        return OpenAILike(
+            model=self.config.model_name(),
+            api_base=self.config.api_base(),
+            api_key=self.config.api_key,
+             http_client=self._http_client,
+             async_http_client=self._async_http_client,
+            **llm_kwargs,
         )
 
-    def _run_tools(self, tool_calls: List[Dict[str, Any]]) -> None:
-        """
-        Execute each tool selected by the model, append the results to the history,
-        and loop back so the model can reason over the tool outputs.
-        """
-        for tool_call in tool_calls:
-            tool_name = tool_call["function"]["name"]
-            arguments = json.loads(tool_call["function"]["arguments"] or "{}")
-            logger.info("Invoking tool %s with arguments %s", tool_name, arguments)
+    def _create_workflow(self, tools: Iterable[BaseTool]) -> AgentWorkflow:
+        kwargs: Dict[str, Any] = dict(
+            llm=self._llm,
+            system_prompt=self.config.system_prompt,
+        )
+        if self._event_handler is not None:
+            kwargs["event_handler"] = self._event_handler
 
-            tool = self._get_tool(tool_name)
-            tool_output = self._safe_tool_call(tool, arguments)
+        return AgentWorkflow.from_tools_or_functions(list(tools), **kwargs)
 
-            tool_message = ChatMessage(
-                role=MessageRole.TOOL,
-                content=str(tool_output),
-                additional_kwargs={
-                    "name": tool_name,
-                    "tool_call_id": tool_call.get("id"),
-                },
+    def _execute_workflow(self, message: str, **run_kwargs: Any):
+        history = list(self._chat_history)
+
+        async def _run() -> Any:
+            return await self._workflow.run(
+                user_msg=message,
+                chat_history=history,
+                **run_kwargs,
             )
-            self._chat_history.append(tool_message)
 
-    def _get_tool(self, name: str) -> BaseTool:
-        for tool in self.tools:
-            if tool.metadata.name == name:
-                return tool
-        raise ValueError(f"Tool with name '{name}' not registered.")
+        return _run_sync(_run())
 
-    def _safe_tool_call(self, tool: BaseTool, arguments: Dict[str, Any]) -> ToolOutput:
-        try:
-            return tool(**arguments)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.exception("Tool %s failed: %s", tool.metadata.name, exc)
-            return ToolOutput(
-                tool_name=tool.metadata.name,
-                content=f"Tool error: {exc}",
-                raw_input={"kwargs": arguments},
-                raw_output=None,
-                is_error=True,
+    def _materialize_tool_messages(self, tool_calls: Any) -> List[ChatMessage]:
+        messages: List[ChatMessage] = []
+        for call in tool_calls or []:
+            tool_output = getattr(call, "tool_output", None)
+            content: str
+            if tool_output is None:
+                content = ""
+            else:
+                content = getattr(tool_output, "content", str(tool_output))
+
+            additional_kwargs = {
+                "name": getattr(call, "tool_name", None),
+            }
+            tool_call_id = getattr(call, "tool_id", None)
+            if tool_call_id is not None:
+                additional_kwargs["tool_call_id"] = tool_call_id
+
+            logger.debug(
+                "Tool call: name=%s kwargs=%s output=%s",
+                additional_kwargs.get("name"),
+                getattr(call, "tool_kwargs", None),
+                getattr(tool_output, "raw_output", content if tool_output else None),
             )
+
+            messages.append(
+                ChatMessage(
+                    role=MessageRole.TOOL,
+                    content=content,
+                    additional_kwargs=additional_kwargs,
+                )
+            )
+        return messages
+
+    @staticmethod
+    def _ensure_chat_message(response: Any) -> ChatMessage:
+        if isinstance(response, ChatMessage):
+            return response
+        return ChatMessage(role=MessageRole.ASSISTANT, content=str(response or ""))
+
+
+def _run_sync(awaitable):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(awaitable)
+
+    if loop.is_running():
+        raise RuntimeError(
+            "TGIChatAgent.chat() cannot be called while an event loop is running in the same thread."
+        )
+
+    return loop.run_until_complete(awaitable)

@@ -2,9 +2,15 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
-from src.agent_tgi import TGIChatAgent, TGIConfig
-from src.agent_gemini import GeminiChatAgent, GeminiConfig
+
+try:  # pragma: no cover - optional dependencies
+    from src.agent_tgi import TGIChatAgent, TGIConfig
+    from src.agent_gemini import GeminiChatAgent, GeminiConfig
+except ImportError as exc:  # pragma: no cover
+    pytest.skip(f"Agent tests require optional dependencies: {exc}", allow_module_level=True)
+
 from src.agent_tools import WordCountTool, SummationTool, EchoTool
 
 

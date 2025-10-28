@@ -6,6 +6,7 @@ details of RAG integration and tool implementations to the caller.
 
 from __future__ import annotations
 
+import os
 import json
 import logging
 from dataclasses import dataclass
@@ -33,7 +34,7 @@ class GeminiConfig:
     """Gemini client configuration."""
 
     api_key: str
-    model: str = "gemini-2.0-flash"
+    model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     safety_settings: Optional[Dict[str, Any]] = None
     generation_config: Optional[Dict[str, Any]] = None
 
@@ -81,6 +82,7 @@ class GeminiChatAgent:
         """
         self._append_user_message(message)
         while True:
+            logger.debug("Gemini chat history: %s", self._chat_history)
             model_response = self._invoke_model(tool_choice)
             assistant_message = self._wrap_assistant_message(model_response)
             self._chat_history.append(assistant_message)
