@@ -36,12 +36,16 @@ class EchoTool(BaseTool):
     def metadata(self) -> ToolMetadata:
         return self._metadata
 
-    def __call__(self, **kwargs) -> ToolOutput:
+    def __call__(self, input: Any | None = None, **kwargs: Any) -> ToolOutput:
+        payload: Dict[str, Any] = {}
+        if input is not None:
+            payload["input"] = input
+        payload.update(kwargs)
         return ToolOutput(
             tool_name=self._metadata.name,
-            content=json.dumps(kwargs),
-            raw_input={"kwargs": kwargs},
-            raw_output=kwargs,
+            content=json.dumps(payload),
+            raw_input={"kwargs": payload},
+            raw_output=payload,
         )
 
 

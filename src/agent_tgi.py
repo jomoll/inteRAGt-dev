@@ -27,7 +27,11 @@ class TGIConfig:
     timeout: float = 120.0
     api_key: Optional[str] = None
     model: Optional[str] = None
-    system_prompt: str = "You are a helpful assistant."
+    system_prompt: str = (
+        "You are a helpful tool-using assistant. Examine the available tools, decide "
+        "when each is needed, invoke them with the required arguments, then compose "
+        "your final reply using the tool outputs."
+    )
     llm_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def api_base(self) -> str:
