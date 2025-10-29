@@ -32,7 +32,6 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=F
 @pytest.fixture(scope="module")
 def default_tools():
     return load_default_tools()
-as
 
 def _tool_scenarios():
     word_text = "open source ai"
