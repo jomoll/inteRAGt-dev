@@ -32,12 +32,14 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=F
 @pytest.fixture(scope="module")
 def default_tools():
     return load_default_tools()
-
+as
 
 def _tool_scenarios():
-    word_args = {"text": "open source ai"}
+    word_text = "open source ai"
+    word_args = {"input": word_text}
     sum_args = {"numbers": [1, 2, 3]}
-    echo_args = {"payload": "hello integration"}
+    echo_payload = "hello integration"
+    echo_args = {"input": echo_payload}
 
     def _word_validator(expected: int):
         def _validator(data: dict) -> bool:
@@ -76,9 +78,10 @@ def _tool_scenarios():
             "arguments": word_args,
             "prompt": (
                 "You must call the word_count tool exactly once using the arguments "
-                f"{json.dumps(word_args)}. After the tool returns, reply with only the number of words."
+                f"{json.dumps(word_args)} (the tool expects an 'input' argument). "
+                "After the tool returns, reply with only the number of words."
             ),
-            "validator": _word_validator(len(word_args["text"].split())),
+            "validator": _word_validator(len(word_text.split())),
         },
         {
             "label": "sum_numbers",
@@ -96,9 +99,10 @@ def _tool_scenarios():
             "arguments": echo_args,
             "prompt": (
                 "You must call the echo_tool exactly once using the arguments "
-                f"{json.dumps(echo_args)}. After the tool returns, repeat the payload verbatim."
+                f"{json.dumps(echo_args)} (the tool expects an 'input' argument). "
+                "After the tool returns, repeat the payload verbatim."
             ),
-            "validator": _echo_validator(echo_args),
+            "validator": _echo_validator({"payload": echo_payload}),
         },
     ]
 
