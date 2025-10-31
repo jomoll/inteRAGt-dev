@@ -1,19 +1,18 @@
-"""Integration tests for agents backed by live endpoints.
+"""Integration checks for the lightweight agents talking to live endpoints."""
 
-Run:
-python -m pytest -s src/tests/test_agents_integration.py
-"""
+from __future__ import annotations
 
 import json
 import logging
+import re
 import os
-import time
 from pathlib import Path
+from typing import Any, Dict
 
 import httpx
 import pytest
 from dotenv import load_dotenv
-from llama_index.core.base.llms.types import ChatMessage, MessageRole
+from llama_index.core.base.llms.types import MessageRole
 
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("src.agent_gemini").setLevel(logging.DEBUG)
@@ -23,105 +22,31 @@ try:  # pragma: no cover - optional heavy dependencies
     from src.agent_tgi import TGIChatAgent, TGIConfig
     from src.agent_gemini import GeminiChatAgent, GeminiConfig
 except ImportError as exc:  # pragma: no cover
-    pytest.skip(f"Integration tests require optional agent dependencies: {exc}", allow_module_level=True)
+    pytest.skip(
+        f"Integration tests require optional agent dependencies: {exc}",
+        allow_module_level=True,
+    )
 
 from src.agent_tools import load_default_tools
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=False)
 
+
 @pytest.fixture(scope="module")
 def default_tools():
     return load_default_tools()
 
-def _tool_scenarios():
-    word_text = "open source ai"
-    word_args = {"input": word_text}
-    sum_args = {"numbers": [1, 2, 3]}
-    echo_payload = "hello integration"
-    echo_args = {"input": echo_payload}
 
-    def _word_validator(expected: int):
-        def _validator(data: dict) -> bool:
-            value = data.get("word_count")
-            try:
-                return int(float(value)) == expected
-            except (TypeError, ValueError):
-                return False
-
-        return _validator
-
-    def _sum_validator(expected_sum: float):
-        def _validator(data: dict) -> bool:
-            value = data.get("sum")
-            try:
-                return float(value) == float(expected_sum)
-            except (TypeError, ValueError):
-                return False
-
-        return _validator
-
-    def _echo_validator(expected_payload: dict):
-        def _validator(data: dict) -> bool:
-            # Gemini sometimes echoes using `input` rather than `payload`
-            candidate = dict(data)
-            if "input" in candidate and "payload" not in candidate:
-                candidate["payload"] = candidate["input"]
-            return all(str(candidate.get(key)) == str(val) for key, val in expected_payload.items())
-
-        return _validator
-
+def _rag_scenarios() -> list[Dict[str, Any]]:
     return [
         {
-            "label": "word_count",
-            "tool_name": "word_count",
-            "arguments": word_args,
-            "prompt": (
-                "You must call the word_count tool exactly once using the arguments "
-                f"{json.dumps(word_args)} (the tool expects an 'input' argument). "
-                "After the tool returns, reply with only the number of words."
-            ),
-            "validator": _word_validator(len(word_text.split())),
-        },
-        {
-            "label": "sum_numbers",
-            "tool_name": "sum_numbers",
-            "arguments": sum_args,
-            "prompt": (
-                "You must call the sum_numbers tool exactly once using the arguments "
-                f"{json.dumps(sum_args)}. After the tool returns, reply with only the sum."
-            ),
-            "validator": _sum_validator(sum(sum_args["numbers"])),
-        },
-        {
-            "label": "echo_tool",
-            "tool_name": "echo_tool",
-            "arguments": echo_args,
-            "prompt": (
-                "You must call the echo_tool exactly once using the arguments "
-                f"{json.dumps(echo_args)} (the tool expects an 'input' argument). "
-                "After the tool returns, repeat the payload verbatim."
-            ),
-            "validator": _echo_validator({"payload": echo_payload}),
-        },
+            "label": "retrieve_reports",
+            "question": "Does the patient meet the CAR-T eligibility criteria?",
+            "patient_context": "",
+            "kwargs": {},
+            "min_context": 1,
+        }
     ]
-
-
-def _extract_response_payload(message) -> dict | None:
-    additional = getattr(message, "additional_kwargs", None)
-    if isinstance(additional, dict):
-        payload = additional.get("response")
-        if isinstance(payload, dict):
-            return payload
-
-    content = getattr(message, "content", None)
-    if content is None:
-        return None
-    if isinstance(content, str):
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            return None
-    return None
 
 
 def _print_chat_history(agent, label: str) -> None:
@@ -133,7 +58,50 @@ def _print_chat_history(agent, label: str) -> None:
         role = getattr(message, "role", None)
         content = getattr(message, "content", None)
         additional = getattr(message, "additional_kwargs", None)
-        print(f"  [{idx}] role={role} content={content!r} additional={additional}")
+        if role == MessageRole.TOOL:
+            display = _summarise_tool_message(content, additional)
+            print(f"  [{idx}] role={role} content={display!r}")
+        else:
+            print(f"  [{idx}] role={role} content={content!r}")
+
+
+def _summarise_tool_message(content: str | None, additional: dict | None) -> str:
+    summary = ""
+    try:
+        parsed = json.loads(content or "{}")
+    except Exception:
+        parsed = {}
+    response_text = ""
+    if isinstance(parsed, dict):
+        response = parsed.get("response")
+        if isinstance(response, str):
+            response_text = response
+        elif isinstance(response, dict):
+            text = response.get("response")
+            if isinstance(text, str):
+                response_text = text
+        context_nodes = parsed.get("context_nodes")
+        if isinstance(context_nodes, list):
+            summary += f" [{len(context_nodes)} nodes]"
+
+    response_text = re.sub(r"\s+", " ", response_text).strip()
+    if response_text:
+        summary = response_text[:120] + ("..." if len(response_text) > 120 else "") + summary
+    elif content:
+        summary = re.sub(r"\s+", " ", content).strip()
+        summary = summary[:120] + ("..." if len(summary) > 120 else "")
+
+    if additional and isinstance(additional, dict):
+        name = additional.get("name")
+        args = additional.get("arguments")
+        snippet = f"{name or 'tool'}"
+        if isinstance(args, dict):
+            filters = {k: v for k, v in args.items() if v not in (None, "") and k != "top_k"}
+            if filters:
+                snippet += f" {filters}"
+        summary = f"{snippet}: {summary}"
+
+    return summary
 
 
 @pytest.mark.integration
@@ -145,15 +113,7 @@ def test_tgi_agent_live(default_tools):
     api_key = os.getenv("TGI_API_KEY")
     model_name = os.getenv("TGI_MODEL", "casperhansen/llama-3.3-70b-instruct-awq")
 
-    debug_events = os.getenv("TGI_DEBUG_EVENTS", "0") == "1"
     debug_httpx = os.getenv("TGI_DEBUG_HTTPX", "0") == "1"
-
-    event_handler = None
-    if debug_events:
-        def _log_event(event: object) -> None:
-            print(f"[workflow event] {event}")
-
-        event_handler = _log_event
 
     http_client = None
     http_client_created = False
@@ -187,104 +147,29 @@ def test_tgi_agent_live(default_tools):
         )
         http_client_created = True
 
-    config = TGIConfig(endpoint_url=endpoint, api_key=api_key, model=model_name)
+    config = TGIConfig(
+        endpoint_url=endpoint,
+        api_key=api_key,
+        model=model_name,
+    )
     agent = TGIChatAgent(
         config=config,
         tools=default_tools,
-        event_handler=event_handler,
         http_client=http_client,
     )
 
-    max_retries = int(os.getenv("TGI_MAX_RETRIES", "100"))
-    retry_delay = float(os.getenv("TGI_RETRY_DELAY_SECONDS", "1"))
-    max_iterations = int(os.getenv("TGI_MAX_ITERATIONS", "40"))
-    scenarios = _tool_scenarios()
-
-    def run_prompt(prompt_text: str) -> ChatMessage:
-        last_error: Exception | None = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                return agent.chat(prompt_text, max_iterations=max_iterations)
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-                status = exc.response.status_code if exc.response else None
-                agent.reset()
-                print(
-                    f"[Integration:TGI] Attempt {attempt}/{max_retries} failed with HTTP {status}: {exc!s}"
-                )
-                if status == 404:
-                    pytest.skip(
-                        f"TGI endpoint {endpoint} returned 404 Not Found. "
-                        "Verify the server exposes an OpenAI-compatible /chat/completions route."
-                    )
-                if status in {401, 403}:
-                    pytest.skip(
-                        f"TGI endpoint {endpoint} rejected the request (status {status}). "
-                        "Check API key or auth configuration."
-                    )
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
-            except httpx.RequestError as exc:
-                last_error = exc
-                agent.reset()
-                print(
-                    f"[Integration:TGI] Attempt {attempt}/{max_retries} failed: {exc!s}"
-                )
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
-            except Exception as exc:  # noqa: BLE001 - surface unexpected issues
-                last_error = exc
-                agent.reset()
-                print(
-                    f"[Integration:TGI] Attempt {attempt}/{max_retries} raised unexpected error: {exc!s}"
-                )
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
-        pytest.skip(
-            f"TGI endpoint unavailable after {max_retries} attempts: {last_error}"
-        )
-
     try:
-        for scenario in scenarios:
+        for scenario in _rag_scenarios():
             agent.reset()
-            print(f"\n[Integration:TGI][{scenario['label']}] Prompt: {scenario['prompt']}")
-            reply = run_prompt(scenario["prompt"])
-            final_content = getattr(reply, "content", None)
-            print(f"[Integration:TGI][{scenario['label']}] Final reply: {final_content}")
-
-            tool_messages = [
-                msg
-                for msg in agent._chat_history
-                if msg.role == MessageRole.TOOL  # type: ignore[attr-defined]
-            ]
-            print("[Integration:TGI] Tool messages:")
-            for msg in tool_messages:
-                print("  -", msg.content)
-            _print_chat_history(agent, f"TGI[{scenario['label']}]")
-
-            matching_messages = [
-                msg
-                for msg in tool_messages
-                if msg.additional_kwargs.get("name") == scenario["tool_name"]
-            ]
-            assert matching_messages, (
-                f"Expected at least one tool call for {scenario['tool_name']} but none were recorded."
+            reply = agent.answer_with_rag(
+                scenario["question"],
+                patient_context=scenario["patient_context"],
+                **scenario["kwargs"],
             )
-
-            successful_payloads = []
-            for msg in matching_messages:
-                content_str = msg.content if isinstance(msg.content, str) else str(msg.content)
-                if "Tool error" in content_str:
-                    continue
-                payload = _extract_response_payload(msg)
-                if payload is None:
-                    continue
-                if scenario["validator"](payload):
-                    successful_payloads.append(payload)
-
-            assert (
-                successful_payloads
-            ), f"Tool {scenario['tool_name']} did not produce the expected result."
+            context_nodes = reply.additional_kwargs.get("context_nodes", [])
+            assert len(context_nodes) >= scenario["min_context"], "Expected context nodes from RAG tool"
+            assert reply.content and reply.content.strip(), "Answer should not be empty"
+            _print_chat_history(agent, f"TGI[{scenario['label']}]")
     finally:
         if http_client_created and http_client is not None:
             http_client.close()
@@ -300,63 +185,14 @@ def test_gemini_agent_live(default_tools):
     config = GeminiConfig(api_key=api_key, model=model_name)
     agent = GeminiChatAgent(config=config, tools=default_tools)
 
-    scenarios = _tool_scenarios()
-
-    for scenario in scenarios:
+    for scenario in _rag_scenarios():
         agent.reset()
-        print(f"\n[Integration:Gemini][{scenario['label']}] Prompt: {scenario['prompt']}")
-        reply = agent.chat(scenario["prompt"])
-
-        print(f"[Integration:Gemini][{scenario['label']}] Final reply: {getattr(reply, 'content', None)}")
-        tool_messages = [
-            msg
-            for msg in agent._chat_history
-            if msg.role == MessageRole.TOOL  # type: ignore[attr-defined]
-        ]
-        print("[Integration:Gemini] Tool messages:")
-        for msg in tool_messages:
-            print("  -", msg.content)
-        _print_chat_history(agent, f"Gemini[{scenario['label']}]")
-
-        matching_messages = []
-        for idx, msg in enumerate(tool_messages, start=1):
-            additional = getattr(msg, "additional_kwargs", {})
-            print(
-                f"[Integration:Gemini][{scenario['label']}] tool_message[{idx}] additional_kwargs=",
-                additional,
-            )
-            if additional.get("name") == scenario["tool_name"]:
-                matching_messages.append(msg)
-        assert matching_messages, (
-            f"Expected at least one tool call for {scenario['tool_name']} but none were recorded."
+        reply = agent.answer_with_rag(
+            scenario["question"],
+            patient_context=scenario["patient_context"],
+            **scenario["kwargs"],
         )
-
-        successful_payloads = []
-        for msg in matching_messages:
-            content_str = msg.content if isinstance(msg.content, str) else str(msg.content)
-            print(
-                f"[Integration:Gemini][{scenario['label']}] matching message content=",
-                content_str,
-            )
-            if "Tool error" in content_str:
-                print(
-                    f"[Integration:Gemini][{scenario['label']}] skipping due to tool error"
-                )
-                continue
-            payload = _extract_response_payload(msg)
-            print(
-                f"[Integration:Gemini][{scenario['label']}] extracted payload=",
-                payload,
-            )
-            if payload is None:
-                continue
-            if scenario["validator"](payload):
-                successful_payloads.append(payload)
-            else:
-                print(
-                    f"[Integration:Gemini][{scenario['label']}] payload did not pass validator"
-                )
-
-        assert (
-            successful_payloads
-        ), f"Tool {scenario['tool_name']} did not produce the expected result."
+        context_nodes = reply.additional_kwargs.get("context_nodes", [])
+        assert len(context_nodes) >= scenario["min_context"], "Expected context nodes from RAG tool"
+        assert reply.content and reply.content.strip(), "Answer should not be empty"
+        _print_chat_history(agent, f"Gemini[{scenario['label']}]")
